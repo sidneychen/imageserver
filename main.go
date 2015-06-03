@@ -4,36 +4,48 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
-	"fmt"
-	//	"github.com/kklis/gomemcache"
-	"github.com/bradfitz/gomemcache/memcache"
+	"flag"
+	"runtime"
+
 	"image"
-	"imaging"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path"
 	"strconv"
-	"strings"
+
+	"github.com/gorilla/mux"
+	"github.com/sidneychen/imaging"
 )
 
-const (
-	MEMCACHE_ADDR string = "192.168.94.26:11211"
+var (
+	MEMCACHE_ADDR = "192.168.94.26:11211"
+	FORMAT        = imaging.JPEG
 )
 
 func main() {
-	fmt.Println("Start")
-	http.HandleFunc("/upload", uploadImage)
-	http.HandleFunc("/", getImage)
-	http.HandleFunc("/favicon.ico", nilFunc)
-	err := http.ListenAndServe(":8080", nil)
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	cfgPath := flag.String("conf", "./config.json", "config file path")
+	flag.Parse()
+
+	cfg := NewConfigFromFile(*cfgPath)
+	MEMCACHE_ADDR = cfg.cc.Addr
+
+	r := mux.NewRouter()
+	r.HandleFunc("/favicon.ico", nilHandler).Methods("GET")
+	r.HandleFunc("/{mode}/{pid:[a-z0-9]+}", getImage).Methods("GET")
+	r.HandleFunc("/upload", uploadImage).Methods("POST")
+
+	log.Println("Server started and listening on ", cfg.Listen)
+	err := http.ListenAndServe(cfg.Listen, r)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err.Error())
 	}
 }
 
-func nilFunc(w http.ResponseWriter, r *http.Request) {
+func nilHandler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
@@ -42,39 +54,38 @@ func getKey(pid, mode string) string {
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
-	segments := strings.Split(r.URL.Path, "/")
-	if len(segments) != 3 {
-		fmt.Fprint(w, "invalid uri, ", r.URL)
-		log.Println("invalid uri, ", r.URL)
-		return
-	}
+	params := mux.Vars(r)
+	mode := params["mode"]
+	pid := params["pid"]
 
-	mode := segments[1]
-	pid := segments[2]
+	cache := NewMemcache(MEMCACHE_ADDR)
 
-	memc := memcache.New(MEMCACHE_ADDR)
-	memc.Set(&memcache.Item{Key: "foo", Value: []byte("my value")})
 	flush := r.URL.Query().Get("flush")
 	if flush == "1" {
-		memc.Delete(getKey(pid, mode))
-		log.Println("Delete Image From Memcache: ", pid, mode)
+		cache.Delete(getKey(pid, mode))
+		log.Println("Delete image from cache: ", pid, mode)
 	}
 
-	item, err := memc.Get(getKey(pid, mode))
+	var data []byte
+	var err error
+
+	data, err = cache.Get(getKey(pid, mode))
 	if err == nil {
-		log.Println("Get Image From Memcache: ", pid, mode)
-		w.Write(item.Value)
+		log.Println("Get image from cache: ", pid, mode)
+		w.Write(data)
 		return
 	} else {
-		log.Println("Get Image From Memcache: ", err)
+		log.Println("Get from cache fail pid=", pid, err)
 	}
-	log.Println("Get Image From Filesystem: ", pid, mode)
+
+	log.Println("Get image from fs: ", pid, mode)
 	file, err := getImageFromPid(pid)
 	if err != nil {
 		log.Fatal("ReadAll: ", err.Error())
 		return
 	}
 	defer file.Close()
+
 	img, err := imaging.Decode(file)
 	if err != nil {
 		log.Fatal("Image Decode: ", err.Error())
@@ -83,13 +94,13 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 
 	var buf []byte
 	buffer := bytes.NewBuffer(buf)
-	imaging.Encode(buffer, dstImage, imaging.WEBP, 50)
-	data, err := ioutil.ReadAll(buffer)
+	imaging.Encode(buffer, dstImage, FORMAT, 50)
+	data, err = ioutil.ReadAll(buffer)
 	if err != nil {
 		log.Fatal("ReadAll: ", err.Error())
 		return
 	}
-	memc.Set(&memcache.Item{Key: getKey(pid, mode), Value: data, Expiration: 86400})
+	cache.Set(getKey(pid, mode), data, 86400)
 	w.Write(data)
 }
 
@@ -103,28 +114,24 @@ func transformImage(img image.Image, mode string) image.Image {
 	}
 	return img
 }
+
 func uploadImage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		return
-	}
-	log.Print("start upload image...")
+
+	log.Print("Start upload image...")
 	file, _, err := r.FormFile("image")
 	if err != nil {
-		log.Fatal("FormFile: ", err.Error())
+		log.Panicln("from file: ", err.Error())
 		return
 	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			log.Fatal("Close: ", err.Error())
-		}
-	}()
+	defer file.Close()
 
 	img, err := imaging.Decode(file)
 	if err != nil {
-		log.Fatal("Decode: ", err.Error())
+		log.Panicln("Decode: ", err.Error())
 		return
 	}
 
+	// image metadata
 	width := img.Bounds().Max.X
 	height := img.Bounds().Max.Y
 	file.Seek(0, 0)
@@ -135,15 +142,15 @@ func uploadImage(w http.ResponseWriter, r *http.Request) {
 	pid := getPictureId(length, width, height, hashValue)
 
 	dstImageThumb := resize(img, 1034)
-
 	filename, err := getFilename(pid)
+
 	err = saveToFilesystem(dstImageThumb, filename)
 	if err != nil {
-		log.Fatal("Save: ", err.Error())
+		log.Panicln("Save: ", err.Error())
 		return
 	}
 
-	fmt.Fprint(w, "{\"pid\":\""+pid+"\"}")
+	w.Write([]byte(`{"pid":"` + pid + `"}`))
 
 }
 
@@ -199,7 +206,7 @@ func saveToFilesystem(img image.Image, filename string) error {
 	if err != nil {
 		return err
 	}
-	return imaging.Encode(file, img, imaging.WEBP, 75)
+	return imaging.Encode(file, img, FORMAT, 75)
 }
 
 func getImageFromPid(pid string) (*os.File, error) {
